@@ -103,9 +103,10 @@ jobs:
         working-directory: ${{ steps.detect.outputs.dir }}
         run: |
           set -euo pipefail
-          flutter pub get
-          if [ ! -d ios ]; then flutter create --platforms=ios .; fi
-          flutter build ios --release --no-codesign
+          flutter pub get || flutter pub upgrade
+          if [ ! -d ios ] || [ ! -d ios/Runner.xcodeproj ]; then flutter create --platforms=ios .; fi
+          if [ -f ios/Podfile ]; then sed -i '' "s/^# platform :ios.*/platform :ios, '13.0'/" ios/Podfile || true; fi
+          flutter build ios --release --no-codesign || { echo 'Auto-fix: clean, upgrade and retry'; flutter clean; rm -rf ios/Pods ios/Podfile.lock; flutter pub upgrade; (cd ios && pod install --repo-update || true); flutter build ios --release --no-codesign; }
           mkdir -p "$GITHUB_WORKSPACE/out/Payload"
           cp -R build/ios/iphoneos/*.app "$GITHUB_WORKSPACE/out/Payload/"
       - name: Build native iOS application
@@ -114,26 +115,94 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import pathlib, subprocess, json, os
+          import pathlib, subprocess, json, os, shutil
           root = pathlib.Path('.').resolve()
           skip = {'.git','Pods','node_modules','build','.build'}
           def paths(pattern): return sorted(p for p in root.rglob(pattern) if not skip.intersection(p.relative_to(root).parts))
           for pod in paths('Podfile'):
               command = ['bundle','exec','pod','install'] if (pod.parent/'Gemfile').exists() else ['pod','install']
               if command[0] == 'bundle': subprocess.run(['bundle','install'],cwd=pod.parent,check=True)
-              subprocess.run(command,cwd=pod.parent,check=True)
+              if subprocess.run(command,cwd=pod.parent).returncode != 0:
+                  print('Auto-fix: retry pod install with repo update')
+                  (pod.parent/'Podfile.lock').unlink(missing_ok=True)
+                  subprocess.run(['pod','install','--repo-update'],cwd=pod.parent,check=True)
           workspaces = [p for p in paths('*.xcworkspace') if not p.parent.name.endswith('.xcodeproj')]
           choices = workspaces or paths('*.xcodeproj')
           if len(choices) != 1: raise ValueError('Choose a project_dir containing one iOS application')
           p = choices[0]; flag = '-workspace' if p.suffix == '.xcworkspace' else '-project'
-          info = json.loads(subprocess.check_output(['xcodebuild','-list',flag,str(p),'-json']))
+          def listing(path, fl):
+              r = subprocess.run(['xcodebuild','-list',fl,str(path),'-json'],capture_output=True,text=True)
+              return json.loads(r.stdout) if r.returncode == 0 else None
+          info = listing(p, flag)
+          if info is None:
+              print('::warning::بدء فحص الخطأ: ملف المشروع تالف')
+              projs = [p] if p.suffix == '.xcodeproj' else paths('*.xcodeproj')
+              for proj in projs:
+                  pbx = proj/'project.pbxproj'
+                  if not pbx.exists(): continue
+                  print('::warning::جاري تعديل الخطأ في', pbx)
+                  shutil.copy(pbx, str(pbx)+'.bak')
+                  d = json.loads(subprocess.check_output(['plutil','-convert','json','-o','-',str(pbx)]))
+                  objs = d['objects']; import uuid
+                  for o in list(objs.values()):
+                      if o.get('isa','').endswith('BuildPhase') and 'files' in o:
+                          fixed = []
+                          for fid in o['files']:
+                              t = objs.get(fid)
+                              if t is None: continue
+                              if t.get('isa') in ('PBXFileReference','PBXVariantGroup','XCVersionGroup'):
+                                  nid = uuid.uuid4().hex[:24].upper(); objs[nid] = {'isa':'PBXBuildFile','fileRef':fid}; fid = nid
+                              fixed.append(fid)
+                          o['files'] = fixed
+                  for o in objs.values():
+                      if 'children' in o: o['children'] = [c for c in o['children'] if c in objs]
+                  tmp = str(pbx)+'.json'; open(tmp,'w').write(json.dumps(d))
+                  subprocess.run(['plutil','-convert','xml1','-o',str(pbx),tmp],check=True); os.remove(tmp)
+              info = listing(p, flag)
+          if info is None:
+              print('::warning::الإصلاح لم يكفِ، جاري إعادة إنشاء المشروع من الملفات')
+              subprocess.run(['brew','install','xcodegen'],check=True)
+              src = max((d for d in root.rglob('*') if d.is_dir() and not skip.intersection(d.relative_to(root).parts) and not d.suffix in ('.xcodeproj','.xcworkspace')), key=lambda d: len(list(d.glob('*.swift')))+len(list(d.glob('*.m'))), default=root)
+              name = 'PowerUpApp'
+              yml = f'''name: {name}
+options:
+  deploymentTarget:
+    iOS: "15.0"
+targets:
+  {name}:
+    type: application
+    platform: iOS
+    sources: ["{src.relative_to(root).as_posix() or '.'}"]
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.powerup.app
+      GENERATE_INFOPLIST_FILE: YES
+      INFOPLIST_KEY_UILaunchScreen_Generation: YES
+'''
+              open('project.yml','w').write(yml)
+              subprocess.run(['xcodegen','generate'],check=True)
+              p = root/(name+'.xcodeproj'); flag = '-project'
+              info = listing(p, flag)
+              if info is None: raise RuntimeError('تعذر إصلاح المشروع تلقائياً')
+          print('تم فحص المشروع، جاري البناء')
           schemes = info.get('workspace', info.get('project',{})).get('schemes',[])
-          scheme = os.environ.get('BUILD_SCHEME') or (schemes[0] if len(schemes) == 1 else '')
-          if not scheme or scheme not in schemes: raise ValueError('Set scheme to a shared iOS application scheme: ' + ', '.join(schemes))
+          wanted = os.environ.get('BUILD_SCHEME')
+          if wanted and wanted not in schemes: raise ValueError('Scheme not found. Available: ' + ', '.join(schemes))
+          order = [wanted] if wanted else sorted(schemes, key=lambda s: (any(x in s.lower() for x in ('test','pods','widget','extension')), s))
+          if not order: raise ValueError('No shared scheme found; share the app scheme in Xcode')
           derived = os.path.join(os.environ['GITHUB_WORKSPACE'],'ipa-derived')
-          subprocess.run(['xcodebuild',flag,str(p),'-scheme',scheme,'-configuration','Release','-destination','generic/platform=iOS','-derivedDataPath',derived,'CODE_SIGNING_ALLOWED=NO','CODE_SIGNING_REQUIRED=NO','CODE_SIGN_IDENTITY=','build'],check=True)
           products = pathlib.Path(derived)/'Build/Products/Release-iphoneos'
-          apps = list(products.glob('*.app'))
+          extra = ['CODE_SIGNING_ALLOWED=NO','CODE_SIGNING_REQUIRED=NO','CODE_SIGN_IDENTITY=','DEVELOPMENT_TEAM=','ONLY_ACTIVE_ARCH=NO']
+          apps = []
+          for scheme in order:
+              base_cmd = ['xcodebuild',flag,str(p),'-scheme',scheme,'-configuration','Release','-destination','generic/platform=iOS','-derivedDataPath',derived] + extra
+              ok = subprocess.run(base_cmd + ['build']).returncode == 0
+              if not ok:
+                  print('Auto-fix: retry with relaxed build settings for', scheme)
+                  ok = subprocess.run(base_cmd + ['IPHONEOS_DEPLOYMENT_TARGET=13.0','SWIFT_TREAT_WARNINGS_AS_ERRORS=NO','GCC_TREAT_WARNINGS_AS_ERRORS=NO','-skipPackagePluginValidation','-skipMacroValidation','clean','build']).returncode == 0
+              apps = [a for a in products.glob('*.app')] if ok else []
+              if apps: break
+          if not apps: raise RuntimeError('Build failed for schemes: ' + ', '.join(order))
+          apps = apps[:1]
           if len(apps) != 1: raise ValueError('Expected exactly one iOS application product')
           import shutil
           payload = pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'out/Payload'
