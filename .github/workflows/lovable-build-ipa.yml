@@ -164,20 +164,8 @@ jobs:
               subprocess.run(['brew','install','xcodegen'],check=True)
               src = max((d for d in root.rglob('*') if d.is_dir() and not skip.intersection(d.relative_to(root).parts) and not d.suffix in ('.xcodeproj','.xcworkspace')), key=lambda d: len(list(d.glob('*.swift')))+len(list(d.glob('*.m'))), default=root)
               name = 'PowerUpApp'
-              yml = f'''name: {name}
-options:
-  deploymentTarget:
-    iOS: "15.0"
-targets:
-  {name}:
-    type: application
-    platform: iOS
-    sources: ["{src.relative_to(root).as_posix() or '.'}"]
-    settings:
-      PRODUCT_BUNDLE_IDENTIFIER: com.powerup.app
-      GENERATE_INFOPLIST_FILE: YES
-      INFOPLIST_KEY_UILaunchScreen_Generation: YES
-'''
+              rel = src.relative_to(root).as_posix() or '.'
+              yml = '\n'.join(['name: '+name,'options:','  deploymentTarget:','    iOS: "15.0"','targets:','  '+name+':','    type: application','    platform: iOS','    sources: ["'+rel+'"]','    settings:','      PRODUCT_BUNDLE_IDENTIFIER: com.powerup.app','      GENERATE_INFOPLIST_FILE: YES','      INFOPLIST_KEY_UILaunchScreen_Generation: YES',''])
               open('project.yml','w').write(yml)
               subprocess.run(['xcodegen','generate'],check=True)
               p = root/(name+'.xcodeproj'); flag = '-project'
